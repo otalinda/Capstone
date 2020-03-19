@@ -1,5 +1,6 @@
 library(plyr)
 library(tidyverse)
+library(e1071)
 library(caret)
 library(randomForest)
 library(ggplot2)
@@ -17,6 +18,7 @@ library(scales)
 library(gridExtra)
 library(cowplot)
 library(gtable)
+library(xgboost)
 
 ############################################################################################
 #Import data, assign column names, remove missing values#
@@ -615,22 +617,22 @@ share %>%
     
     
     data_all <- data_all %>% 
-      mutate(cap_gain = ifelse(capital_gain <= 3464, " Low",
-                               ifelse(capital_gain > 3464 & capital_gain < 14084, " Medium", " High")))
+      mutate(cap_gain = ifelse(capital_gain <= 3464, "Low",
+                               ifelse(capital_gain > 3464 & capital_gain < 14084, "Medium", "High")))
     
     
     data_all$cap_gain <- factor(data_all$cap_gain,
                                 ordered = TRUE,
-                                levels = c(" Low", " Medium", " High"))
+                                levels = c("Low", "Medium", "High"))
     
     data_all <- data_all %>% 
-      mutate(cap_loss = ifelse(capital_loss <= 1672, " Low",
-                               ifelse(capital_gain > 1672 & capital_gain < 1977, " Medium", " High")))
+      mutate(cap_loss = ifelse(capital_loss <= 1672, "Low",
+                               ifelse(capital_gain > 1672 & capital_gain < 1977, "Medium", "High")))
     
     
     data_all$cap_loss <- factor(data_all$cap_loss,
                                 ordered = TRUE,
-                                levels = c(" Low", " Medium", " High"))
+                                levels = c("Low", "Medium", "High"))
     
     
   
@@ -638,11 +640,12 @@ share %>%
   #Explore Associations Among Features#
   #####################################
   
-  #1)Continuous Variables
-  
-  #Remove the final_weight, and outcome variable from the dataset
+  #Remove undesired features and outcome variable from the dataset
   cor_vars <- subset(data_all, select = -c(final_weight,
-                                           income_category))
+                                           income_category,
+                                           native_country,
+                                           capital_gain,
+                                           capital_loss))
   
   #Convert all factor levels to numeric
   cor_vars$workclass <- as.numeric(cor_vars$workclass)
@@ -652,7 +655,9 @@ share %>%
   cor_vars$relationship <- as.numeric(cor_vars$relationship)
   cor_vars$race <- as.numeric(cor_vars$race)
   cor_vars$sex <- as.numeric(cor_vars$sex)
-  cor_vars$native_country <- as.numeric(cor_vars$native_country)
+  cor_vars$native_region <- as.numeric(cor_vars$native_region)
+  cor_vars$cap_gain <- as.numeric(cor_vars$cap_gain)
+  cor_vars$cap_loss<- as.numeric(cor_vars$cap_loss)
   
   
   #Compute the correlations and create the correlation matrix, then heatmap
@@ -660,13 +665,254 @@ share %>%
   melted_cordata <- melt(cordata)
   head(melted_cordata)
   
-  melted_cordata %>% ggplot(aes(x=X1, y=X2, fill=value, label=value)) +
+  p22 <- melted_cordata %>% ggplot(aes(x=Var1, y=Var2, fill=value, label=value)) +
     geom_tile() +
     scale_fill_viridis() +
     xlab("") +
     ylab("") + 
     geom_text(color = "white") +
-    ggtitle("Correlation Matrix of Features - Excluding Weight Variable")
+    ggtitle("Correlation Matrix of Selected Features")
+  
+  p22
   
   
+  ############################################################################################
+  #Partition the data and train MS models
+  #NOTE: 90% for training and 10% for testing# 
+  ############################################################################################
   
+  #Retain only selected features from the dataset and partiion the data 
+  
+  data_final <- subset(data_all, select = -c(final_weight,
+                                             native_country,
+                                             capital_gain,
+                                             capital_loss))
+  
+  
+  set.seed(1) 
+  test_index <- createDataPartition(y = data_final$income_category, times = 1, p = 0.1, list = FALSE)
+  training <- data_final[-test_index,]
+  testing <- data_final[test_index,]
+  
+  #ONE HOT ENCODING
+  #Convert non-binary categorical features to numeric (do this for training and testing set)
+  ##########################################################################################
+  ohe_features = c("workclass", "education_level", "marital_status", "occupation", "relationship",
+                   "race", "native_region")
+  
+  #Training Set
+  dummies_train <- dummyVars(~ workclass + education_level + marital_status +
+                               occupation + relationship + race + native_region,
+                             data = training)
+  
+  
+  ohe_dummies_train <- as.data.frame(predict(dummies_train, newdata = training))
+  training_ohe <- cbind(training[,-c(which(colnames(training) %in% ohe_features))],ohe_dummies_train)
+  
+  training_ohe$cap_gain <- as.numeric(training_ohe$cap_gain)
+  training_ohe$cap_loss <- as.numeric(training_ohe$cap_loss)
+  
+  
+  #Testing Set
+  dummies_test <- dummyVars(~ workclass + education_level + marital_status +
+                              occupation + relationship + race + native_region,
+                            data = testing)
+  
+  ohe_dummies_test <- as.data.frame(predict(dummies_test, newdata = testing))
+  testing_ohe <- cbind(testing[,-c(which(colnames(testing) %in% ohe_features))],ohe_dummies_test)
+  
+  testing_ohe$cap_gain <- as.numeric(testing_ohe$cap_gain)
+  testing_ohe$cap_loss <- as.numeric(testing_ohe$cap_loss)
+  
+  
+  str(training_ohe)
+  str(testing_ohe)
+  
+  
+  #1) LOGISTIC REGRESSION#
+  #######################
+  
+  #TRAINING ATTEMPT 1: WITHOUT ONE HOT ENCODED VARIABLES
+  # Define cross validation parameters
+  train_control <- trainControl(method = "cv", number = 20, p = .8)
+  
+  # Train the model on training set
+  logit_fit1 <- train(income_category ~ .,
+                 data = training,
+                 trControl = train_control,
+                 method = "glm",
+                 family=binomial())
+  
+  
+  #Fit the model on testing set
+  predictions1 <- predict(logit_fit1, testing)
+  
+  #Compute balanced accuracy
+  BA_1 <- F_meas(data = predictions1, reference = testing$income_category, beta = .9)
+  
+  #TRAINING ATTEMPT 2: WITH ONE HOT ENCODED VARIABLES
+  
+  logit_fit2 <- train(income_category ~ .,
+                     data = training_ohe,
+                     trControl = train_control,
+                     method = "glm",
+                     family=binomial())
+  
+  #Fit the model on testing set
+  predictions2 <- predict(logit_fit2, testing_ohe)
+  
+  #Compute balanced accuracy
+  BA_2 <- F_meas(data = predictions2, reference = testing_ohe$income_category, beta = .9)
+  
+  #Add results to a table
+  results <- data.frame(Method = c("Simple Logistic Regression", "Logistic Regression With One-Hot Encoding"),
+                                   Balanced_Accuracy = c(BA_1, BA_2))
+  
+  logit_fit1$finalModel
+  logit_fit2$finalModel
+  
+  results  
+  
+  
+  #2) SUPPORT VECTOR MACHINES#
+  ############################
+  
+  #Scale the numeric features in both the training and the teting set 
+  
+  training_svm <- training 
+  training_svm$age <- scale(training_svm$age)
+  training_svm$hours_per_week <- scale(training_svm$hours_per_week)
+ 
+  testing_svm <- testing 
+  testing_svm$age <- scale(testing_svm$age)
+  testing_svm$hours_per_week <- scale(testing_svm$hours_per_week)
+  
+  str(training_svm)
+  str(testing_svm)
+  
+  #Train the model using same cross validation parameters as before
+  train_control <- trainControl(method = "cv", number = 20, p = .8)
+  
+  library(kernlab)
+  
+  #grid <- expand.grid(C = seq(0,2,.25))
+  
+  svm_linear <- train(income_category ~ .,
+                      data = training_svm,
+                      trControl = train_control,
+                      method = "svmLinear",
+                      tuneLength = 10)
+
+  warnings()
+  
+  #Generate predictions
+  predictions3 = predict(svm_linear, testing_svm) 
+  
+  #Compute balanced accuracy of linear support vector machine
+  BA_3 <- F_meas(data = predictions3, reference = testing_svm$income_category, beta = .9)
+  
+  #Add results to a table
+  results <- bind_rows(results, 
+                           data.frame(Method = "Support Vector Machines with Linear Kernel", Balanced_Accuracy =  BA_3))
+  
+  results
+  
+  
+  #3) GRADIENT BOOSTING#
+  #####################
+  
+  #Convert sex feature (still coded as a factor) to numeric
+  training_ohe$sex <- as.numeric(training_ohe$sex)
+  testing_ohe$sex <- as.numeric(testing_ohe$sex)
+
+  #Separate target variable (income_category) from training and testing sets (one hot encoded) and convert to numeric
+  
+  tr_labels <- training_ohe$income_category
+  tr_labels <- as.numeric(tr_labels) -1 
+  str(tr_labels)
+  
+  ts_labels <- testing_ohe$income_category
+  ts_labels <- as.numeric(ts_labels) -1 
+  str(ts_labels)
+  
+  
+  training_ohe <- training_ohe %>% select(-income_category)
+  testing_ohe <- testing_ohe %>% select(-income_category)
+  
+
+  #Convert training and testing sets into matrices then reattach to labels
+  xgtrain <- matrix(as.numeric(unlist(training_ohe)),nrow=nrow(training_ohe))
+  xgtest <- matrix(as.numeric(unlist(testing_ohe)),nrow=nrow(testing_ohe))
+  
+  str(xgtrain)
+  length(tr_labels)
+  
+  str(xgtest)
+  length(ts_labels)
+  
+  xgtrain <- xgb.DMatrix(data = xgtrain, label = tr_labels) 
+  xgtest <- xgb.DMatrix(data = xgtest, label = ts_labels)
+  
+  
+  #Define tuning parameters
+  
+  # nrounds = number of trees to grow
+  #max.depth = the maximum number of partitions in a tree; the more splits, the information is captured
+  # eta = the learning rate, i.e. degree to which the weight of each consecutive tree is reduced
+  # min_child_rate = minimum Hessian weight required for a new partition; when min is reached, partitions stop 
+  # gamma  = the minimum loss reduction required to make an additional partition
+  # colsample_bytree = the proportion of features supplied to a tree
+  
+  
+  params <- list(booster = "gbtree",
+                 objective = "binary:logistic",
+                 max_depth = seq(2,15, 1),
+                 eta = seq(0.05, 0.3, .05),
+                 min_child_weight = c(1, 3, 5, 7),
+                 gamma = c(0, 0.4, 0.1),
+                 colsample_bytree = seq(0.3,0.8,0.1))
+  
+  #Find the best number of iterations (trees) using cross validation module
+  set.seed(0) 
+  xgboost_ideal <- xgb.cv(data = xgtrain, 
+                       nrounds = 250,
+                       nfold = 10,
+                       params = params, 
+                       verbose = TRUE,
+                       maximize = F,
+                       stratified = T, 
+                       print_every_n = 10,
+                       early_stopping_rounds = 20,
+                       eval_metric="error")
+  
+  #Look at the results (note: CV test error is an optimistic estimate of the actual test error)
+  xgboost_ideal
+ 
+  #Train model using ideal number of iterations found above
+  
+  xgboost_fit <- xgb.train(data = xgtrain, 
+                          nrounds = 240,
+                          nfold = 10,
+                          params = params, 
+                          verbose = TRUE,
+                          maximize = F,
+                          print_every_n = 10,
+                          early_stopping_rounds = 20,
+                          watchlist = list(val=xgtest,train=xgtrain),
+                          eval_metric="error")
+  
+  #Generate predictions, and convert to binary by using threshold of .5 
+  predictions4 = predict(xgboost_fit, xgtest) 
+  predictions4 <- ifelse (predictions4 > 0.5,1,0)
+  
+  #Compute balanced accuracy of extreme gradient boosting
+  ts_labels <- as.factor(ts_labels)
+  predictions4 <- as.factor(predictions4)
+  BA_4 <- F_meas(data = predictions4, reference = ts_labels, beta = .9)
+  
+  #Add results to a table
+  results <- bind_rows(results, 
+                       data.frame(Method = "Gradient Boosted Tree", Balanced_Accuracy =  BA_4))
+  
+ results
+ 
